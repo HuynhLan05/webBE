@@ -1,169 +1,133 @@
 const db = require("../db");
 
 class Order {
-  static async getAll() {
-    const [orders] = await db.query("SELECT * FROM orders");
-    return orders;
-  }
-
-  static async getById(orderId) {
-    const [order] = await db.query("SELECT * FROM orders WHERE id = ?", [orderId]);
-    if (order.length === 0) return null; // Trả về null nếu không tìm thấy
-
-    // Lấy danh sách sản phẩm trong đơn hàng
-    const [items] = await db.query(
-      "SELECT productID, quantity, unit_price FROM order_items WHERE order_id = ?",
-      [orderId]
-    );
-
-    return { ...order[0], items };
-  }
-
-
-  // Tạo đơn hàng mới
-  static async create({ customerID, total_price, total_quantity, shipping_address, responsible_person, items }) {
-    if (!customerID || !total_price || !total_quantity || !shipping_address || !responsible_person || !Array.isArray(items) || items.length === 0) {
-      throw new Error("Dữ liệu đầu vào không hợp lệ!");
+    // 📌 Lấy tất cả đơn hàng
+    static async getAll() {
+        const [orders] = await db.query("SELECT * FROM orders");
+        return orders;
     }
+
+    // 📌 Lấy chi tiết đơn hàng
+    static async getById(orderId) {
+      const [order] = await db.query("SELECT * FROM orders WHERE id = ?", [orderId]);
+      if (order.length === 0) return null;
   
-    const connection = await db.getConnection();
-    try {
-      await connection.beginTransaction();
-  
-      // Bước 1: Tạo đơn hàng
-      const [orderResult] = await connection.query(
-        "INSERT INTO orders (customerID, total_price, total_quantity, shipping_address, responsible_person) VALUES (?, ?, ?, ?, ?)",
-        [customerID, total_price, total_quantity, shipping_address, responsible_person]
+      // Lấy danh sách sản phẩm trong đơn hàng
+      const [items] = await db.query(
+          "SELECT oi.productID, oi.quantity, oi.unit_price, (oi.quantity * oi.unit_price) AS item_total_price FROM order_items oi WHERE oi.order_id = ?",
+          [orderId]
       );
   
-      const orderId = orderResult.insertId;
+      return { ...order[0], items };
+  }
   
-      // Bước 2: Thêm sản phẩm vào `order_items`
-      for (const item of items) {
-        if (!item.productID || !item.quantity || !item.unit_price) {
-          throw new Error("Thông tin sản phẩm không hợp lệ!");
+
+    // 📌 Tạo đơn hàng mới
+    static async create({ customerID, shipping_address, responsible_person, items }) {
+      const connection = await db.getConnection();
+      try {
+          await connection.beginTransaction();
+  
+          // 📌 Bước 1: Tạo đơn hàng (ban đầu total_price = 0)
+          const [orderResult] = await connection.query(
+              "INSERT INTO orders (customerID, shipping_address, responsible_person, status, total_quantity, total_price) VALUES (?, ?, ?, 'Pending', 0, 0)",
+              [customerID, shipping_address, responsible_person]
+          );
+          const orderId = orderResult.insertId;
+  
+          let totalQuantity = 0;
+          let totalPrice = 0;
+  
+          // 📌 Bước 2: Thêm sản phẩm vào `order_items` và cập nhật kho
+          for (const item of items) {
+              const [product] = await connection.query(
+                  "SELECT price FROM products WHERE productID = ?",
+                  [item.productID]
+              );
+              if (product.length === 0) throw new Error(`Sản phẩm ID ${item.productID} không tồn tại!`);
+  
+              const unitPrice = product[0].price;
+              const itemTotalPrice = item.quantity * unitPrice;
+  
+              await connection.query(
+                  "INSERT INTO order_items (order_id, productID, quantity, unit_price) VALUES (?, ?, ?, ?)",
+                  [orderId, item.productID, item.quantity, unitPrice]
+              );
+  
+              totalQuantity += item.quantity;
+              totalPrice += itemTotalPrice;
+  
+              // 📌 Trừ kho trong bảng `products`
+              await connection.query(
+                  "UPDATE products SET stock = stock - ? WHERE productID = ? AND stock >= ?",
+                  [item.quantity, item.productID, item.quantity]
+              );
+  
+              // 📌 Cập nhật `inventory`: Giảm `stock_level`, tăng `sold_quantity`
+              await connection.query(
+                  "UPDATE inventory SET stock_level = stock_level - ?, sold_quantity = sold_quantity + ? WHERE productID = ?",
+                  [item.quantity, item.quantity, item.productID]
+              );
+          }
+  
+          // 📌 Bước 3: Cập nhật tổng số lượng và tổng tiền của đơn hàng
+          await connection.query(
+              "UPDATE orders SET total_quantity = ?, total_price = ? WHERE id = ?",
+              [totalQuantity, totalPrice, orderId]
+          );
+  
+          await connection.commit();
+          return orderId;
+      } catch (error) {
+          await connection.rollback();
+          throw error;
+      } finally {
+          connection.release();
+      }
+  }
+  
+  
+
+    // 📌 Hủy đơn hàng (Cộng lại kho)
+    static async cancel(orderId) {
+        const connection = await db.getConnection();
+        try {
+            await connection.beginTransaction();
+
+            const [orderItems] = await connection.query(
+                "SELECT productID, quantity FROM order_items WHERE order_id = ?",
+                [orderId]
+            );
+
+            for (const item of orderItems) {
+                await connection.query(
+                    "UPDATE products SET stock = stock + ? WHERE productID = ?",
+                    [item.quantity, item.productID]
+                );
+            }
+
+            await connection.query("DELETE FROM order_items WHERE order_id = ?", [orderId]);
+            await connection.query("DELETE FROM orders WHERE id = ?", [orderId]);
+
+            await connection.commit();
+            return true;
+        } catch (error) {
+            await connection.rollback();
+            throw error;
+        } finally {
+            connection.release();
         }
-        await connection.query(
-          "INSERT INTO order_items (order_id, productID, quantity, unit_price) VALUES (?, ?, ?, ?)",
-          [orderId, item.productID, item.quantity, item.unit_price]
+    }
+
+    // 📌 Cập nhật trạng thái đơn hàng
+    static async updateStatus(orderId, newStatus) {
+        const [result] = await db.query(
+            "UPDATE orders SET status = ? WHERE id = ?",
+            [newStatus, orderId]
         );
-      }
-  
-      await connection.commit();
-      return orderId;
-    } catch (error) {
-      await connection.rollback();
-      throw error;
-    } finally {
-      connection.release();
+
+        return result.affectedRows > 0;
     }
-  }
-  
-  static async update(orderId, { total_price, total_quantity, shipping_address, responsible_person, items }) {
-    const connection = await db.getConnection();
-    try {
-      await connection.beginTransaction();
-  
-      // Cập nhật thông tin đơn hàng
-      await connection.query(
-        "UPDATE orders SET total_price = ?, total_quantity = ?, shipping_address = ?, responsible_person = ? WHERE id = ?",
-        [total_price, total_quantity, shipping_address, responsible_person, orderId]
-      );
-  
-      // Xóa sản phẩm cũ trong đơn hàng
-      await connection.query("DELETE FROM order_items WHERE order_id = ?", [orderId]);
-  
-      // Thêm sản phẩm mới vào `order_items`
-      for (const item of items) {
-        if (!item.productID || !item.quantity || !item.unit_price) {
-          throw new Error("Thông tin sản phẩm không hợp lệ!");
-        }
-        await connection.query(
-          "INSERT INTO order_items (order_id, productID, quantity, unit_price) VALUES (?, ?, ?, ?)",
-          [orderId, item.productID, item.quantity, item.unit_price]
-        );
-      }
-  
-      await connection.commit();
-      return true;
-    } catch (error) {
-      await connection.rollback();
-      throw error;
-    } finally {
-      connection.release();
-    }
-  }
-  
-  // Cập nhật trạng thái đơn hàng + Cập nhật kho nếu "Delivered"
-  static async updateStatus(orderId, newStatus) {
-    const connection = await db.getConnection();
-    try {
-      await connection.beginTransaction();
-  
-      // Cập nhật trạng thái đơn hàng
-      const [result] = await connection.query("UPDATE orders SET status = ? WHERE id = ?", [newStatus, orderId]);
-  
-      if (result.affectedRows === 0) {
-        throw new Error("Không tìm thấy đơn hàng!");
-      }
-  
-      // Nếu đơn hàng đã giao thành công, cập nhật kho hàng
-      if (newStatus === "Delivered") {
-        console.log(`Cập nhật kho cho đơn hàng ${orderId}`);
-        await this.updateInventory(orderId, connection);
-      }
-  
-      await connection.commit();
-      return true;
-    } catch (error) {
-      await connection.rollback();
-      throw error;
-    } finally {
-      connection.release();
-    }
-  }
-  
-  static async delete(orderId) {
-    const connection = await db.getConnection();
-    try {
-      await connection.beginTransaction();
-  
-      // Xóa sản phẩm trong đơn hàng
-      await connection.query("DELETE FROM order_items WHERE order_id = ?", [orderId]);
-  
-      // Xóa đơn hàng
-      const [result] = await connection.query("DELETE FROM orders WHERE id = ?", [orderId]);
-  
-      await connection.commit();
-      return result.affectedRows > 0;
-    } catch (error) {
-      await connection.rollback();
-      throw error;
-    } finally {
-      connection.release();
-    }
-  }
-  
-  // Cập nhật kho hàng dựa vào sản phẩm trong đơn hàng
-  static async updateInventory(orderId, connection) {
-    const [orderItems] = await connection.query(
-      "SELECT productID, quantity FROM order_items WHERE order_id = ?",
-      [orderId]
-    );
-  
-    for (const item of orderItems) {
-      const [updateResult] = await connection.query(
-        "UPDATE inventory SET stock_level = stock_level - ?, sold_quantity = sold_quantity + ? WHERE productID = ? AND stock_level >= ?",
-        [item.quantity, item.quantity, item.productID, item.quantity]
-      );
-  
-      // Nếu không cập nhật được, có thể do hàng tồn kho không đủ
-      if (updateResult.affectedRows === 0) {
-        throw new Error(`Kho không đủ hàng cho sản phẩm ID ${item.productID}`);
-      }
-    }
-  }
-  
 }
 
 module.exports = Order;

@@ -8,3 +8,4 @@ router.put("/:id", promotionController.updatePromotion);
 router.delete("/:id", promotionController.deletePromotion);
 
 module.exports = router;
+
